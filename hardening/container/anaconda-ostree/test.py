@@ -27,40 +27,35 @@ if versions.rhel.is_true_rhel():
 else:
     src_image = f'quay.io/centos-bootc/centos-bootc:stream{major}'
 
-# TODO: remove after new OpenSCAP with oscap-im is released on RHEL-9
-if versions.rhel <= 9:
-    copr = 'packit/OpenSCAP-openscap-maint-1.3'
-    openscap_from_copr = [
-        'RUN dnf -y install dnf-plugins-core',
-        f'RUN dnf -y copr enable {copr} centos-stream-{versions.rhel.major}-x86_64',
-    ]
-    openscap_from_copr_str = '\n    '.join(openscap_from_copr)
-else:
-    openscap_from_copr_str = ''
-
 # prepare a RpmPack with testing-specific hacks
 # - copy it to CWD because podman cannot handle absolute paths (or relative ones
 #   going above CWD) as source for COPY or RUN --mount
 pack = util.RpmPack()
+pack.add_host_repos()
 pack.add_sshd_late_start()
 with pack.build() as pack_binrpm:
-    shutil.copy(pack_binrpm, 'contest-rpmpack.rpm')
+    shutil.copy(pack_binrpm, 'contest-pack.rpm')
 
-# prepare a Container file for making a hardened image
+# prepare a Container file for making a hardened image;
+# the contest-pack is installed so a custom openscap or a newer openscap
+# from host repositories can be installed/tested and it is then removed before
+# running oscap-im to ensure that host repositories are not used when openscap
+# installs packages during remediation; finally the contest-pack is installed
+# back again to re-deploy the testing-specific hacks
 cfile = podman.Containerfile()
 cfile += util.dedent(fr'''
     FROM {src_image}
     # install testing-specific RpmPack
-    COPY contest-rpmpack.rpm /root/.
-    RUN dnf -y install /root/contest-rpmpack.rpm
-    RUN rm -f /root/contest-rpmpack.rpm
+    COPY contest-pack.rpm /root/.
+    RUN dnf -y install /root/contest-pack.rpm
     # copy over testing-specific datastream
     COPY remediation-ds.xml /root/.
     # install and run oscap-im to harden the image
-    {openscap_from_copr_str}
-    RUN dnf -y install openscap-utils
+    RUN dnf -y install openscap-utils openscap-engine-sce
+    RUN dnf --noautoremove -y remove contest-pack
     RUN oscap-im --profile '{profile}' \
         --results-arf /root/remediation-arf.xml /root/remediation-ds.xml
+    RUN dnf -y install /root/contest-pack.rpm; rm -f /root/contest-pack.rpm
 ''')
 cfile.add_ssh_pubkey(guest.ssh_pubkey)
 cfile.write_to('Containerfile')
@@ -93,6 +88,9 @@ with podman.Registry(host_addr=virt.NETWORK_HOST) as registry:
     )
     guest.install_basic(
         kickstart=ks,
+        # Anaconda installer may itself perform cryptographic operations so
+        # it also needs to run with fips=1, see
+        # https://docs.fedoraproject.org/en-US/bootc/security-and-hardening/
         kernel_args=['fips=1'] if with_fips else None,
     )
 
