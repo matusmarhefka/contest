@@ -60,10 +60,14 @@ class _RpmVerCmp:
 
 
 class _Rhel(_RpmVerCmp):
-    def __init__(self):
-        _update_os_release()
+    def __init__(self, version=None, id=None):
         self._release_separator = '.'
-        v = _os_release['VERSION_ID'].split(self._release_separator)
+        if version and id:
+            v = version.split(self._release_separator)
+            _os_release['ID'] = id
+        else:
+            _update_os_release()
+            v = _os_release['VERSION_ID'].split(self._release_separator)
         if len(v) == 1:
             self.version = v[0]
             self.major = int(v[0])
