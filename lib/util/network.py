@@ -10,12 +10,11 @@ def wait_for_tcp(host, port, *, timeout=600, to_shutdown=False, compare=None):
 
     Optionally, read len(compare) bytes from the socket and compare them to
     the bytestring specified in 'compare'. If they are different, close the
-    socket and (re)try again later.
-    Useful for waiting for b'SSH-' to start answering on port 22.
+    socket and (re)try again later. With 'to_shutdown' set as well, return
+    once the endpoint stops returning the comparison bytes, even if TCP still
+    accepts connections.
+    Useful for waiting for b'SSH-' to start or stop answering on a forwarded port.
     """
-    if compare is not None and to_shutdown:
-        raise ValueError("compare and to_shutdown are mutually exclusive")
-
     state = 'stop' if to_shutdown else 'start'
     util.log(f"waiting for {host}:{port} to {state} listening for {timeout}s", skip_frames=1)
 
@@ -33,16 +32,31 @@ def wait_for_tcp(host, port, *, timeout=600, to_shutdown=False, compare=None):
     # for that case
     reset_sleep = 1
 
+    def read_compare(sock):
+        """Read a complete comparison prefix, tolerating partial recv calls."""
+        data = b''
+        while len(data) < len(compare):
+            try:
+                chunk = sock.recv(len(compare) - len(data))
+            except TimeoutError:
+                break
+            if not chunk:
+                break
+            data += chunk
+        return data
+
     # use reliable monotonic time, not wall clock or timedeltas
     overall_end = time.monotonic() + timeout
     while time.monotonic() < overall_end:
         try:
             with socket.create_connection((host, port), timeout=socket_timeout) as s:
                 if compare is not None:
-                    data = s.recv(len(compare))
-                    if data == compare:
+                    data = read_compare(s)
+                    if data == compare and not to_shutdown:
                         return
-                    # something else on the port? .. just wait + close
+                    if data != compare and to_shutdown:
+                        return
+                    # not ready yet, or still serving SSH
                     time.sleep(reset_sleep)
                 elif to_shutdown:
                     # connected, socket still up, sleep + close and try again

@@ -85,6 +85,7 @@ import textwrap
 import contextlib
 import tempfile
 import json
+import socket
 import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
@@ -98,11 +99,14 @@ GUEST_SSH_USER = 'root'
 
 GUEST_IMG_DIR = '/var/lib/libvirt/images'
 
-NETWORK_NETMASK = '255.255.252.0'
-NETWORK_HOST = '192.168.120.1'
-# 1000 guest addrs, refreshing after a week, should be enough
-NETWORK_RANGE = ['192.168.120.2', '192.168.123.254']
-NETWORK_EXPIRY = 168
+# Address on which services are bound in the test runner's network namespace.
+NETWORK_HOST = '127.0.0.1'
+# Address of the test runner as seen from QEMU user networking (SLIRP).
+NETWORK_GUEST = '10.0.2.2'
+
+QEMU_NETWORK_ID = 'contest-net'
+QEMU_NAMESPACE = 'http://libvirt.org/schemas/domain/qemu/1.0'
+ET.register_namespace('qemu', QEMU_NAMESPACE)
 
 # installing from HTTP URL leads to Anaconda downloading stage2
 # to RAM, leading to notably higher memory requirements during
@@ -151,60 +155,8 @@ class Host:
         return False
 
     @staticmethod
-    def setup_network():
-        net_name = 'default'
-
-        # unfortunately, there's no easy way to tell if we have changed the
-        # libvirt-included default network - libvirt seems to silently erase both
-        # <title> and <description> and dump-xml ignores <metadata> too,
-        # so just rely on ip address ranges - in the case of a rare false positive
-        # match, we'll just re-define the network, no big deal
-        def is_our_network(xml):
-            return re.search(
-                f'''<range start='{NETWORK_RANGE[0]}' end='{NETWORK_RANGE[1]}'>''',
-                xml,
-            )
-
-        def define_our_network():
-            util.log(f"defining libvirt network: {net_name}")
-            net_xml = util.dedent(fr'''
-                <network>
-                  <name>{net_name}</name>
-                  <forward mode='nat'/>
-                  <bridge stp='off' delay='0'/>
-                  <ip address='{NETWORK_HOST}' netmask='{NETWORK_NETMASK}'>
-                    <dhcp>
-                      <range start='{NETWORK_RANGE[0]}' end='{NETWORK_RANGE[1]}'>
-                        <lease expiry='{NETWORK_EXPIRY}' unit='hours'/>
-                      </range>
-                    </dhcp>
-                  </ip>
-                </network>
-            ''')
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.xml') as f:
-                f.write(net_xml)
-                f.flush()
-                virsh('net-define', f.name, check=True)
-            virsh('net-autostart', net_name, check=True)
-            virsh('net-start', net_name, check=True)
-
-        info = virsh('net-info', net_name, stdout=PIPE, stderr=DEVNULL, text=True)
-        # if default already exists
-        if info.returncode == 0:
-            dumpxml = virsh('net-dumpxml', net_name, stdout=PIPE, text=True)
-            if not is_our_network(dumpxml.stdout):
-                if re.search(r'\nActive: +yes\n', info.stdout):
-                    virsh('net-destroy', net_name, check=True)
-                virsh('net-undefine', net_name, check=True)
-                define_our_network()
-        else:
-            define_our_network()
-
-    @staticmethod
     def create_sshvm(dest):
         dest = Path(dest)
-        if dest.exists():
-            return
         script = util.dedent(r'''
             #!/bin/bash
             function list { virsh -q list "$@" | sed -rn 's/^ *[-0-9]+ +([^ ]+).*/\1/p'; }
@@ -220,13 +172,25 @@ class Host:
                 done
             fi
             [[ -z $sshkey ]] && { echo "no valid VM found" >&2; exit 1; }
-            # get ip and ssh to it
-            ip=$(virsh -q domifaddr "$vm" | sed -rn 's/.+ +([^ ]+)\/[0-9]+$/\1/p')
-            [[ -z $ip ]] && { echo "could not get IP addr for $vm" >&2; exit 1; }
-            echo "waiting for ssh on $vm: root@$ip:22"
-            while ! ncat --send-only -w 1 "$ip" 22 </dev/null 2>&0; do sleep 0.1; done
-            ssh -q -i "$sshkey" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-                -o ServerAliveInterval=1 "root@$ip"
+            # Find the persistent QEMU user-mode networking port.
+            ipaddr=127.0.0.1
+            port=$(virsh -q dumpxml "$vm" | sed -rn \
+                's/.*hostfwd=tcp:127\.0\.0\.1:([0-9]+)-:22.*/\1/p')
+            if [[ -z $port ]]; then
+                echo "could not get QEMU user-mode networking port for $vm" >&2
+                exit 1
+            fi
+            echo "waiting for ssh on $vm: root@$ipaddr:$port"
+            # -w only limits connecting. The SSH endpoint keeps an accepted
+            # connection open while waiting for a client banner, so bound each
+            # receive attempt with ncat's idle I/O timeout instead.
+            while ! ncat --recv-only --idle-timeout 1 "$ipaddr" "$port" 2>/dev/null \
+                | grep -q '^SSH-'; do
+                sleep 0.1
+            done
+            ssh -q -p "$port" -i "$sshkey" -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=1 \
+                "root@$ipaddr"
         ''')
         script = script.replace('%SSHKEY_DIR%', GUEST_IMG_DIR)  # f-strings cannot have \
         dest.write_text(script)
@@ -294,7 +258,7 @@ class Host:
         else:
             # modular libvirtd daemons - always start sockets, restart service
             # if already running (config applies next time it's socket-started)
-            for daemon in ['virtqemud', 'virtnetworkd', 'virtstoraged', 'virtlogd']:
+            for daemon in ['virtqemud', 'virtstoraged', 'virtlogd']:
                 util.subprocess_run(
                     ['systemctl', 'start', '--quiet', f'{daemon}.socket'],
                     check=True,
@@ -305,7 +269,6 @@ class Host:
                     check=True,
                 )
 
-        cls.setup_network()
         cls.create_sshvm('/root/contest-sshvm')
 
 
@@ -433,7 +396,8 @@ class Guest:
     def __init__(self, tag=None, *, name=GUEST_NAME):
         self.tag = tag or str(uuid.uuid4())
         self.name = name
-        self.ipaddr = None
+        self.ipaddr = NETWORK_HOST
+        self.port = None
         self.ssh_keyfile_path = Path(f'{GUEST_IMG_DIR}/{name}.sshkey')
         self.ssh_pubkey = None
         self.disk_path = None
@@ -444,6 +408,47 @@ class Guest:
         self.install_ready_path = Path(f'{GUEST_IMG_DIR}/{name}.install_ready')
         # if True, all snapshot preparation processes were successful
         self.snapshot_ready = False
+
+    def _allocate_port(self):
+        """
+        Select an unused high TCP port for QEMU user-mode networking.
+
+        Closing the probe socket does not reserve the port.  The actual QEMU
+        process performs the binding, and a conflict is reported explicitly if
+        another process wins the race before the domain starts.
+        """
+        for _ in range(10):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind((self.ipaddr, 0))
+                port = probe.getsockname()[1]
+            if port > 1024:
+                return port
+        raise RuntimeError(f"could not allocate a QEMU user-mode networking port for {self.name}")
+
+    def _port_is_available(self):
+        """Return whether the selected host port can currently be bound."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            try:
+                probe.bind((self.ipaddr, self.port))
+            except OSError:
+                return False
+        return True
+
+    def _prepare_port(self):
+        self.port = self._allocate_port()
+        if not self._port_is_available():
+            raise RuntimeError(
+                f"QEMU user-mode networking port {self.port} for {self.name} is already in use",
+            )
+
+    def _load_port(self):
+        if self.port is not None:
+            return
+        self.port = get_domain_port(self.name)
+        if self.port is None:
+            raise RuntimeError(
+                f"guest {self.name} has no QEMU user-mode networking port",
+            )
 
     def install_basic(
         self, location=None, kickstart=None, secure_boot=False, virt_install_args=None,
@@ -470,6 +475,8 @@ class Guest:
         Use 'raw' for pre-allocated disks or 'qcow2' for thin-provisioned disks.
         """
         util.log(f"installing guest {self.name}")
+
+        self._prepare_port()
 
         # location (install URL) not given, try using first one found amongst host
         # repository URLs that has Anaconda stage2 image
@@ -501,7 +508,9 @@ class Guest:
                 '--name', self.name, '--vcpus', '1', '--memory', str(INSTALL_TIME_RAM),
                 # Use pre-created disk
                 '--disk', f'path={disk_path},format={disk_format},io=threads,cache=none',
-                '--network', 'network=default', '--location', location,
+                '--network', 'none',
+                f'--qemu-commandline={qemu_user_network_commandline(self.port)}',
+                '--location', location,
                 '--graphics', 'none', '--console', 'pty', '--rng', '/dev/urandom',
                 # this has nothing to do with rhel8, it just tells v-i to use virtio
                 '--initrd-inject', ksfile, '--os-variant', 'rhel8-unknown',
@@ -538,6 +547,11 @@ class Guest:
                                 f"installation failed: {util.make_printable(line)}",
                             )
                     if proc.wait() > 0:
+                        if not self._port_is_available():
+                            raise RuntimeError(
+                                "virt-install failed: could not allocate QEMU user-mode "
+                                f"networking port {self.port} (port is already in use)",
+                            )
                         raise RuntimeError("virt-install failed")
             except Exception as e:
                 self.destroy()
@@ -588,11 +602,12 @@ class Guest:
             with util.BackgroundHTTPServer(NETWORK_HOST, 0) as srv:
                 srv.add_dir(repo, 'repo')
                 http_host, http_port = srv.start()
+                guest_http_host = qemu_user_network_host_address(http_host)
                 # now that we know the address/port of the HTTP server, add it to
                 # the kickstart as well
                 kickstart.add_install_only_repo(
                     'contest-rpmpack',
-                    f'http://{http_host}:{http_port}/repo',
+                    f'http://{guest_http_host}:{http_port}/repo',
                 )
                 kickstart.packages.append(util.RpmPack.NAME)
                 # install the OS using our kickstart
@@ -615,11 +630,14 @@ class Guest:
 
         util.log(f"importing {disk_path} as {disk_format}")
 
+        self._prepare_port()
+
         virt_install = [
             'pseudotty', 'virt-install',
             '--name', self.name, '--vcpus', '1', '--memory', str(INSTALL_TIME_RAM),
             '--disk', f'path={disk_path},format={disk_format},io=native,cache=none',
-            '--network', 'network=default',
+            '--network', 'none',
+            f'--qemu-commandline={qemu_user_network_commandline(self.port)}',
             '--graphics', 'none', '--console', 'pty', '--rng', '/dev/urandom',
             '--noreboot', '--import',
             # this has nothing to do with rhel8, it just tells v-i to use virtio
@@ -633,9 +651,17 @@ class Guest:
             virt_install += ['--boot', 'firmware=efi,loader_secure=yes']
 
         executable = util.libdir / 'pseudotty'
-        util.subprocess_run(
-            virt_install, executable=executable, check=True, stderr=subprocess.PIPE,
-        )
+        try:
+            util.subprocess_run(
+                virt_install, executable=executable, check=True, stderr=subprocess.PIPE,
+            )
+        except subprocess.CalledProcessError:
+            if not self._port_is_available():
+                raise RuntimeError(
+                    "virt-install failed: could not allocate QEMU user-mode "
+                    f"networking port {self.port} (port is already in use)",
+                ) from None
+            raise
 
         # installed system doesn't need as much RAM, alleviate swap pressure
         if final_mem:
@@ -643,8 +669,10 @@ class Guest:
 
         self.disk_path = disk_path
         self.disk_format = disk_format
+        self.install_ready_path.write_text(self.tag)
 
     def start(self):
+        self._load_port()
         if guest_domstate(self.name) == 'shut off':
             virsh('start', self.name, check=True)
 
@@ -665,9 +693,8 @@ class Guest:
         """Reboot by issuing 'reboot' via ssh."""
         util.log("rebooting using qemu-guest-agent")
         self.guest_agent_cmd('guest-shutdown', {'mode': 'reboot'}, blind=True)
-        wait_for_ssh(self.ipaddr, to_shutdown=True)
-        self.ipaddr = wait_for_ifaddr(self.name)
-        wait_for_ssh(self.ipaddr)
+        wait_for_ssh(self.ipaddr, self.port, to_shutdown=True)
+        wait_for_ssh(self.ipaddr, self.port)
 
     def reset(self):
         util.log("rebooting using 'virsh reset'")
@@ -710,9 +737,7 @@ class Guest:
 
         # do guest first boot, let it settle and finish firstboot tasks
         self.start()
-        if not self.ipaddr:
-            self.ipaddr = wait_for_ifaddr(self.name)
-        wait_for_ssh(self.ipaddr)
+        wait_for_ssh(self.ipaddr, self.port)
         util.log("sleeping for 30sec for firstboot to settle")
         time.sleep(30)
         # then shut it down + start again, to get the lowest possible page cache
@@ -722,8 +747,7 @@ class Guest:
         #self.shutdown()  # clean shutdown
         #util.log(f"starting {self.name} back up")
         #self.start()
-        #ip = wait_for_ifaddr(self.name)
-        #wait_for_ssh(ip)
+        #wait_for_ssh(self.ipaddr, self.port)
         #util.log("sleeping for 30sec for second boot to settle, for imaging")
         #time.sleep(30)  # fully finish booting (ssh starts early)
 
@@ -777,7 +801,7 @@ class Guest:
                 "prepare_for_snapshot() needs to be used first",
             )
         self._restore_snapshotted()
-        wait_for_ssh(self.ipaddr)
+        wait_for_ssh(self.ipaddr, self.port)
         yield self
 
     @contextlib.contextmanager
@@ -790,9 +814,7 @@ class Guest:
         the guest before taking a snapshot.
         """
         self.start()
-        if not self.ipaddr:
-            self.ipaddr = wait_for_ifaddr(self.name)
-        wait_for_ssh(self.ipaddr)
+        wait_for_ssh(self.ipaddr, self.port)
         try:
             yield self
         finally:
@@ -812,7 +834,8 @@ class Guest:
 
     def _do_ssh(self, *cmd, func=util.subprocess_run, **run_args):
         ssh_cmdline = [
-            'ssh', '-q', '-i', self.ssh_keyfile_path, '-o', 'BatchMode=yes',
+            'ssh', '-q', '-p', str(self.port), '-i', self.ssh_keyfile_path,
+            '-o', 'BatchMode=yes',
             '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null',
             f'{GUEST_SSH_USER}@{self.ipaddr}', '--', *cmd,
         ]
@@ -829,7 +852,8 @@ class Guest:
 
     def _do_scp(self, *args):
         cmd = [
-            'scp', '-q', '-i', self.ssh_keyfile_path, '-o', 'BatchMode=yes',
+            'scp', '-q', '-P', str(self.port), '-i', self.ssh_keyfile_path,
+            '-o', 'BatchMode=yes',
             '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null',
             *args,
         ]
@@ -843,7 +867,7 @@ class Guest:
 
     def _do_rsync(self, *args):
         ssh = (
-            f'ssh -q -i {self.ssh_keyfile_path}'
+            f'ssh -q -p {self.port} -i {self.ssh_keyfile_path}'
             ' -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
         )
         return util.subprocess_run(
@@ -862,7 +886,9 @@ class Guest:
             local_args = local_path
         else:
             local_args = (local_path,)
-        self._do_rsync(*rsync_opts, *local_args, f'{GUEST_SSH_USER}@{self.ipaddr}:{remote_path}')
+        self._do_rsync(
+            *rsync_opts, *local_args, f'{GUEST_SSH_USER}@{self.ipaddr}:{remote_path}',
+        )
 
     def generate_ssh_keypair(self):
         private = self.ssh_keyfile_path
@@ -904,6 +930,7 @@ class Guest:
         ]
         for f in files:
             f.unlink(missing_ok=True)
+        self.port = None
 
 
 #
@@ -930,39 +957,53 @@ def wait_for_domstate(name, state, timeout=300):
     raise TimeoutError(f"wait for {name} to be in {state} timed out")
 
 
+def qemu_user_network_commandline(port):
+    """Return the QEMU arguments for a user-networked guest."""
+    return (
+        f'-netdev user,id={QEMU_NETWORK_ID},'
+        f'hostfwd=tcp:{NETWORK_HOST}:{port}-:22 '
+        # libvirt uses pcie.0 slot 0x1 for its root ports, therefore
+        # we give this manually-added endpoint an explicit, separate address
+        f'-device virtio-net-pci,netdev={QEMU_NETWORK_ID},addr=0x5'
+    )
+
+
+def qemu_user_network_host_address(host_address):
+    """Translate a host loopback address to QEMU user networking's host alias."""
+    if host_address != NETWORK_HOST:
+        raise ValueError(
+            f"{host_address} is not the configured QEMU user-network host address",
+        )
+    return NETWORK_GUEST
+
+
+def port_from_domain_xml(xmlstr):
+    """Extract Contest's persistent QEMU user-mode networking port from domain XML."""
+    domain = ET.fromstring(xmlstr)
+    qemu_arg = f'{{{QEMU_NAMESPACE}}}arg'
+    for arg in domain.iter(qemu_arg):
+        value = arg.get('value', '')
+        match = re.search(
+            rf'hostfwd=tcp:{re.escape(NETWORK_HOST)}:(\d+)-:22(?:$|[, ]|\s)',
+            value,
+        )
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def get_domain_port(name):
+    """Return the QEMU user-mode networking port configured in a libvirt domain."""
+    ret = virsh('dumpxml', name, '--inactive', stdout=PIPE, check=True, text=True)
+    return port_from_domain_xml(ret.stdout)
+
+
 #
 # ssh related helpers, generally used from Guest()
 #
 
-def domifaddr(name):
-    """
-    Return a guest's IP address, queried from libvirt.
-    """
-    ret = virsh('domifaddr', name, stdout=PIPE, text=True, check=True)
-    first = ret.stdout.strip().split('\n')[0]  # in case of multiple interfaces
-    if not first:
-        raise ConnectionError(f"guest {name} has no address assigned yet")
-    addr_mask = first.split()[3]
-    addr = addr_mask.split('/')[0]
-    return addr
-
-
-def wait_for_ifaddr(name, timeout=600, sleep=0.5):
-    util.log(f"waiting for IP addr of {name} for up to {timeout}sec")
-    end_time = datetime.now() + timedelta(seconds=timeout)
-    while datetime.now() < end_time:
-        try:
-            return domifaddr(name)
-        except ConnectionError:
-            time.sleep(sleep)
-    raise TimeoutError(f"wait for {name} IP addr timed out (not requested DHCP?)")
-
-
 def wait_for_ssh(host, port=22, *, to_shutdown=False):
-    if to_shutdown:
-        util.wait_for_tcp(host, port, to_shutdown=True)
-    else:
-        util.wait_for_tcp(host, port, compare=b'SSH-')
+    util.wait_for_tcp(host, port, compare=b'SSH-', to_shutdown=to_shutdown)
 
 
 #

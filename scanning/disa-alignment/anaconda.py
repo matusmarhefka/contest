@@ -17,11 +17,12 @@ with util.BackgroundHTTPServer(virt.NETWORK_HOST, 0) as srv:
     oscap.unselect_rules(util.get_datastream(), 'remediation-ds.xml', remediation.excludes())
     srv.add_file('remediation-ds.xml')
 
-    host, port = srv.start()
+    http_host, http_port = srv.start()
+    guest_http_host = virt.qemu_user_network_host_address(http_host)
 
     oscap_conf = {
         'content-type': 'datastream',
-        'content-url': f'http://{host}:{port}/remediation-ds.xml',
+        'content-url': f'http://{guest_http_host}:{http_port}/remediation-ds.xml',
         'profile': shared.profile,
     }
     ks.add_oscap_addon(oscap_conf)

@@ -17,8 +17,8 @@ from pathlib import Path
 from lib import util
 
 REGISTRY_IMAGE = 'https://github.com/RHSecurityCompliance/contest-data/raw/refs/heads/main/data/docker-registry.tar.gz'
-# podman bridge subnet, just beyond the libvirt 192.168.120.0/22 range
-# - podman defaults to 10.88.x.x which tends to conflict a lot
+# podman bridge subnet, chosen away from the common default 10.88.x.x range
+# to reduce conflicts with the host environment
 NETWORK_SUBNET = '192.168.124.0/24'
 
 
@@ -138,9 +138,12 @@ class Registry:
         # local_image is ie. '127.0.0.1:12345/foobar'
         ...
     """
-    def __init__(self, name='contest-registry', host_addr='127.0.0.1'):
+    def __init__(
+        self, name='contest-registry', host_addr='127.0.0.1', guest_addr='10.0.2.2',
+    ):
         self.name = name
         self.addr = host_addr
+        self.guest_addr = guest_addr
         self.registry_image = None
         self.registry_proc = None
         self.tagged = set()
@@ -207,6 +210,22 @@ class Registry:
             raise RuntimeError(f"could not parse port mapping from: {portmap}")
         host, port = match.groups()
         return (host, int(port))
+
+    def get_guest_listen_addr(self):
+        """Return the registry endpoint as seen from a QEMU user-networked guest."""
+        return (self.guest_addr, self.get_listen_addr()[1])
+
+    def guest_reference(self, image):
+        """Translate a host-local pushed image reference for a guest consumer."""
+        local_addr, separator, image_path = image.partition('/')
+        if not separator:
+            raise ValueError(f"invalid local registry image reference: {image}")
+        try:
+            _, port = local_addr.rsplit(':', 1)
+            int(port)
+        except (ValueError, TypeError):
+            raise ValueError(f"invalid local registry image reference: {image}") from None
+        return f'{self.guest_addr}:{port}/{image_path}'
 
     def push(self, image):
         """
